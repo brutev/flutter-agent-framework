@@ -1,0 +1,26 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# Local machine files
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Runtime/project-local agent state
+.flutter-agent/reports/
+.flutter-agent/audit/
+.flutter-agent/project_profile.json
+
+# Build and editor output
+dist/
+build/
+.idea/
+.vscode/

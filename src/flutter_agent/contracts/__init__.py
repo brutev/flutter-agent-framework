@@ -1,0 +1,2 @@
+"""Machine-checkable task contracts."""
+

@@ -1,0 +1,9 @@
+[architecture]
+domain_forbidden_imports = ["flutter", "dio", "get_it"]
+
+[naming]
+cubit_filename_pattern = "^[a-z][a-z0-9_]*_cubit\\.dart$"
+
+[dependencies]
+forbidden = ["bloc"]
+

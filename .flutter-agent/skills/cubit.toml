@@ -1,0 +1,4 @@
+name = "cubit"
+instructions = "Create a Cubit, explicit loading/success/error states, awaited async work, and Cubit tests."
+triggers = ["cubit", "state management"]
+
