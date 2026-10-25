@@ -5,6 +5,7 @@ import httpx
 from flutter_agent.config import ProviderConfig
 from flutter_agent.providers.base import ModelResponse, ModelProvider
 from flutter_agent.providers.normalize import normalize_openai
+from flutter_agent.providers.errors import ProviderFailure, ProviderFailureCategory
 from flutter_agent.security.secrets import redact_secrets
 
 
@@ -48,8 +49,9 @@ class OpenRouterProvider(ModelProvider):
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 if response.status_code == 401:
-                    raise RuntimeError(
-                        "OpenRouter authentication failed (401). Check OPENROUTER_API_KEY in this terminal."
+                    raise ProviderFailure(
+                        "OpenRouter authentication failed (401). Check OPENROUTER_API_KEY in this terminal.",
+                        ProviderFailureCategory.PERMANENT,
                     ) from exc
                 detail = ""
                 try:
@@ -62,7 +64,10 @@ class OpenRouterProvider(ModelProvider):
                 except ValueError:
                     detail = response.text[:240].strip()
                 suffix = f": {redact_secrets(detail, [key])}" if detail else ""
-                raise RuntimeError(f"OpenRouter request failed ({response.status_code}){suffix}") from exc
+                category = ProviderFailureCategory.RATE_LIMIT if response.status_code == 429 else (
+                    ProviderFailureCategory.TRANSIENT if response.status_code >= 500 else ProviderFailureCategory.PERMANENT
+                )
+                raise ProviderFailure(f"OpenRouter request failed ({response.status_code}){suffix}", category) from exc
             data = response.json()
 
         # Some OpenRouter gateways return a JSON error with HTTP 200 (or a
@@ -77,7 +82,10 @@ class OpenRouterProvider(ModelProvider):
                 detail = str(error)
             else:
                 detail = f"unexpected response shape: {list(data) if isinstance(data, dict) else type(data).__name__}"
-            raise RuntimeError(f"OpenRouter model {self.config.model} failed: {detail}")
+            raise ProviderFailure(
+                f"OpenRouter model {self.config.model} failed: {detail}",
+                ProviderFailureCategory.MALFORMED_RESPONSE,
+            )
 
         return normalize_openai(data)
 

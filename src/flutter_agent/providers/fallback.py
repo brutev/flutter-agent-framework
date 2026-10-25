@@ -1,6 +1,7 @@
 from typing import Any
 
 from flutter_agent.providers.base import ModelProvider, ModelResponse
+from flutter_agent.providers.errors import ProviderFailure, ProviderFailureCategory
 
 
 class FallbackProvider(ModelProvider):
@@ -18,5 +19,10 @@ class FallbackProvider(ModelProvider):
                 return provider.complete(messages, tools)
             except (RuntimeError, ValueError) as exc:
                 failures.append(f"{provider.name}: {exc}")
+                if isinstance(exc, ProviderFailure) and exc.category in {
+                    ProviderFailureCategory.PERMANENT,
+                    ProviderFailureCategory.CANCELLED,
+                }:
+                    raise
         raise RuntimeError("All model fallbacks failed: " + " | ".join(failures))
 

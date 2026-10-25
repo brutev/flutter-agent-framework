@@ -2,6 +2,7 @@ import pytest
 
 from flutter_agent.providers.base import ModelResponse
 from flutter_agent.providers.resilience import ResilientProvider
+from flutter_agent.providers.errors import ProviderFailure, ProviderFailureCategory
 
 
 class Flaky:
@@ -36,3 +37,21 @@ def test_resilience_opens_circuit_after_repeated_failure():
         provider.complete([], [])
     with pytest.raises(RuntimeError, match="Circuit open"):
         provider.complete([], [])
+
+
+def test_resilience_does_not_retry_permanent_failure():
+    class Permanent:
+        name = "permanent"
+        calls = 0
+
+        def complete(self, messages, tools):
+            self.calls += 1
+            raise ProviderFailure("authentication failed", ProviderFailureCategory.PERMANENT)
+
+    inner = Permanent()
+    provider = ResilientProvider(inner, retries=3, backoff_seconds=0)
+    with pytest.raises(RuntimeError):
+        provider.complete([], [])
+    assert inner.calls == 1
+    assert provider.retry_count == 0
+    assert provider.last_failure_category is ProviderFailureCategory.PERMANENT

@@ -64,6 +64,18 @@ def test_loop_returns_tool_errors_to_model(tmp_path):
     assert json.loads(tool_message["content"])["ok"] is False
 
 
+def test_loop_rejects_duplicate_tool_call_ids(tmp_path):
+    provider = FakeProvider([
+        ModelResponse(None, (
+            ToolCall("duplicate", "list_files", {}),
+            ToolCall("duplicate", "list_files", {}),
+        )),
+    ])
+    result = AgentLoop(provider, ToolRegistry(ProjectScope(tmp_path))).run("Inspect")
+    assert not result.completed
+    assert "duplicate" in (result.error or "").lower()
+
+
 def test_loop_rejects_false_completion_when_contract_fails(tmp_path):
     provider = FakeProvider([ModelResponse("Done")])
     loop = AgentLoop(
@@ -86,6 +98,20 @@ def test_loop_stops_before_call_after_budget_is_exceeded(tmp_path):
     assert not result.completed
     assert "budget" in (result.error or "").lower()
     assert len(provider.requests) == 1
+
+
+def test_loop_reserves_budget_before_first_provider_call(tmp_path):
+    provider = FakeProvider([ModelResponse("must not be called")])
+    ledger = CostLedger(budget_usd=0.001, input_per_million=1.0, output_per_million=1.0)
+    result = AgentLoop(
+        provider,
+        ToolRegistry(ProjectScope(tmp_path)),
+        ledger=ledger,
+        reserve_output_tokens=10_000,
+    ).run("Expensive request")
+    assert not result.completed
+    assert "budget" in (result.error or "").lower()
+    assert not provider.requests
 
 
 def test_loop_can_finalize_after_tool_step_limit(tmp_path):

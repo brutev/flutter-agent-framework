@@ -1,0 +1,6 @@
+interface:
+  display_name: "Flutter Core Scaffold"
+  short_description: "Create a safe Flutter lib/core foundation"
+  default_prompt: "Use $flutter-core-scaffold to create a minimal Core folder for this Flutter project."
+policy:
+  allow_implicit_invocation: true

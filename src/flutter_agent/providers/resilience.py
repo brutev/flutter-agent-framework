@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 from flutter_agent.providers.base import ModelProvider, ModelResponse
+from flutter_agent.providers.errors import ProviderFailure, ProviderFailureCategory, classify_provider_failure
 
 
 class ResilientProvider(ModelProvider):
@@ -21,10 +22,17 @@ class ResilientProvider(ModelProvider):
         self.failures = 0
         self.opened_at: float | None = None
         self.name = getattr(provider, "name", "provider")
+        self.attempt_count = 0
+        self.retry_count = 0
+        self.last_latency_seconds = 0.0
+        self.last_failure_category: ProviderFailureCategory | None = None
 
     def _retryable(self, exc: Exception) -> bool:
-        text = str(exc).lower()
-        return any(token in text for token in ("429", "502", "503", "504", "timeout", "temporarily"))
+        return classify_provider_failure(exc) in {
+            ProviderFailureCategory.TRANSIENT,
+            ProviderFailureCategory.RATE_LIMIT,
+            ProviderFailureCategory.TIMEOUT,
+        }
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelResponse:
         if self.opened_at is not None:
@@ -34,18 +42,26 @@ class ResilientProvider(ModelProvider):
             self.failures = 0
 
         last: Exception | None = None
+        started = time.monotonic()
         for attempt in range(self.retries + 1):
+            self.attempt_count += 1
             try:
                 result = self.provider.complete(messages, tools)
                 self.failures = 0
+                self.last_failure_category = None
+                self.last_latency_seconds = time.monotonic() - started
                 return result
             except Exception as exc:
                 last = exc
+                self.last_failure_category = classify_provider_failure(exc)
                 if not self._retryable(exc) or attempt >= self.retries:
                     break
+                self.retry_count += 1
                 time.sleep(self.backoff_seconds * (2 ** attempt))
 
         self.failures += 1
         if self.failures >= self.failure_threshold:
             self.opened_at = time.monotonic()
-        raise RuntimeError(f"{self.name} unavailable after retries: {last}") from last
+        self.last_latency_seconds = time.monotonic() - started
+        category = self.last_failure_category or ProviderFailureCategory.TRANSIENT
+        raise ProviderFailure(f"{self.name} unavailable after retries: {last}", category) from last

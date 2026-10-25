@@ -1,4 +1,6 @@
 from pathlib import Path
+import os
+import tempfile
 
 from flutter_agent.security.scope import ProjectScope
 from flutter_agent.standards.rules import RuleSet, validate_dart_source
@@ -66,7 +68,19 @@ class FilesystemTools:
             if target.exists() and target.is_symlink():
                 return ToolResult(False, error="Refusing to overwrite a symbolic link")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            target = self.scope.resolve(path)
+            if target.exists() and target.is_symlink():
+                return ToolResult(False, error="Refusing to overwrite a symbolic link")
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
             return ToolResult(True, str(target.relative_to(self.scope.root)))
         except (OSError, UnicodeError) as exc:
             return ToolResult(False, error=str(exc))

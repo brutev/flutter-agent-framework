@@ -24,10 +24,27 @@ def test_filesystem_tools_are_project_scoped(tmp_path: Path) -> None:
     assert not escaped.ok
 
 
+def test_write_through_external_directory_symlink_is_rejected(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-project"
+    outside.mkdir()
+    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+    registry = ToolRegistry(ProjectScope(tmp_path))
+    result = registry.execute("write_file", {"path": "linked/escape.dart", "content": "secret"})
+    assert not result.ok
+    assert not (outside / "escape.dart").exists()
+
+
 def test_verify_rejects_unapproved_commands(tmp_path: Path) -> None:
     registry = ToolRegistry(ProjectScope(tmp_path))
     result = registry.execute("verify", {"command": "rm -rf ."})
     assert not result.ok
+
+
+def test_tool_registry_rejects_unknown_and_wrongly_typed_arguments(tmp_path: Path) -> None:
+    registry = ToolRegistry(ProjectScope(tmp_path))
+    assert not registry.execute("read_file", {"path": 42}).ok
+    assert not registry.execute("read_file", {"path": "x", "unexpected": "value"}).ok
+    assert not registry.execute("write_file", {"path": "x"}).ok
 
 
 def test_write_file_rejects_standard_violation(tmp_path: Path) -> None:

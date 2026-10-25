@@ -20,7 +20,7 @@ class AgentResult:
 class AgentLoop:
     """Bounded model/tool loop with no direct filesystem authority."""
 
-    def __init__(self, provider: ModelProvider, tools: ToolRegistry, max_steps: int = 12, contract: TaskContract | None = None, ledger: CostLedger | None = None, finalize_on_limit: bool = False):
+    def __init__(self, provider: ModelProvider, tools: ToolRegistry, max_steps: int = 12, contract: TaskContract | None = None, ledger: CostLedger | None = None, finalize_on_limit: bool = False, reserve_output_tokens: int = 4096):
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
         self.provider = provider
@@ -29,6 +29,13 @@ class AgentLoop:
         self.contract = contract
         self.ledger = ledger
         self.finalize_on_limit = finalize_on_limit
+        self.reserve_output_tokens = reserve_output_tokens
+
+    def _budget_allows(self, messages: list[dict[str, Any]]) -> bool:
+        if self.ledger is None:
+            return True
+        estimated_input = max(1, len(json.dumps(messages, default=str)) // 4)
+        return self.ledger.can_reserve(estimated_input, self.reserve_output_tokens)
 
     def run(self, task: str) -> AgentResult:
         if not task.strip():
@@ -53,14 +60,18 @@ class AgentLoop:
         ]
 
         for step in range(1, self.max_steps + 1):
-            if self.ledger is not None and step > 1 and self.ledger.exceeded:
-                return AgentResult(False, error="Model budget exceeded", steps=step - 1)
+            if not self._budget_allows(messages):
+                return AgentResult(False, error="Insufficient model budget for the next bounded request", steps=step - 1)
             try:
                 response = self.provider.complete(messages, self.tools.schemas())
             except Exception as exc:  # provider failures become an honest run result
                 return AgentResult(False, error=f"Provider failure: {exc}", steps=step)
             if self.ledger is not None:
                 self.ledger.record(response.input_tokens, response.output_tokens)
+
+            call_ids = [call.id for call in response.tool_calls]
+            if any(not call_id for call_id in call_ids) or len(call_ids) != len(set(call_ids)):
+                return AgentResult(False, error="Provider returned empty or duplicate tool-call IDs", steps=step)
 
             if not response.tool_calls:
                 if self.contract is not None:
@@ -110,9 +121,12 @@ class AgentLoop:
                 )
 
         if self.finalize_on_limit:
+            final_messages = messages + [{"role": "user", "content": "Stop using tools. Return a concise final summary based only on the evidence collected."}]
+            if not self._budget_allows(final_messages):
+                return AgentResult(False, error="Insufficient model budget for finalization", steps=self.max_steps)
             try:
                 final = self.provider.complete(
-                    messages + [{"role": "user", "content": "Stop using tools. Return a concise final summary based only on the evidence collected."}],
+                    final_messages,
                     [],
                 )
                 if self.ledger is not None:

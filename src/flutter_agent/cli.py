@@ -70,11 +70,11 @@ from flutter_agent.config import AgentConfig, ProviderConfig
 from flutter_agent.config_loader import load_agent_config
 from flutter_agent.costs.ledger import CostLedger
 from flutter_agent.contracts.loader import load_contract
-from flutter_agent.contracts.validator import validate_contract
 from flutter_agent.providers.registry import create_provider
 from flutter_agent.providers.fallback import FallbackProvider
 from flutter_agent.providers.resilience import ResilientProvider
 from flutter_agent.security.scope import ProjectScope
+from flutter_agent.security.secrets import redact_secrets
 from flutter_agent.planning.task_plan import build_plan
 from flutter_agent.planning.workflow import WorkflowExecutor
 from flutter_agent.skills.loader import load_skills
@@ -89,15 +89,72 @@ from flutter_agent.project.memory import save_profile
 from flutter_agent.project.overrides import apply_project_overrides
 from flutter_agent.routing.router import route_task
 from flutter_agent.state.migrations import ensure_state
+from flutter_agent.playbooks.registry import PlaybookRegistry
+from flutter_agent.tasks import (
+    BudgetLimits,
+    LifecyclePhase,
+    PermissionPolicy,
+    PlanStep,
+    TaskLifecycle,
+    TaskStatus,
+    VerificationRequirement,
+    create_task,
+)
+from flutter_agent.verification.engine import VerificationEngine, select_flutter_checks
+from flutter_agent.verification.models import VerificationReport
 
 app = typer.Typer(help="Governed coding agent for Flutter projects.")
+
+
+def _acceptance_criteria(contract) -> tuple[str, ...]:
+    if contract is None:
+        return ("Complete the stated user goal without unsupported success claims.",)
+    return tuple(
+        [f"Required file: {path}" for path in contract.required_files]
+        + [f"Required symbol: {symbol}" for symbol in contract.required_symbols]
+        + [f"Forbidden content absent: {value}" for value in contract.forbidden_content]
+    ) or ("Complete the stated user goal.",)
+
+
+def _finish_lifecycle(task_record, lifecycle: TaskLifecycle, verification_report, outcome: str):
+    if verification_report is None:
+        verification_status = TaskStatus.FAILED
+        evidence = ()
+        verification_outcome = outcome
+    else:
+        verification_status = TaskStatus.VERIFIED if verification_report.verified else (
+            TaskStatus.FAILED if verification_report.status.value == "FAILED" else TaskStatus.UNVERIFIED
+        )
+        evidence = (f"verification:{verification_report.source_snapshot}",)
+        verification_outcome = verification_report.summary
+    task_record = lifecycle.transition(
+        task_record,
+        LifecyclePhase.VERIFY,
+        verification_status,
+        verification_outcome,
+        evidence,
+    )
+    review_status = TaskStatus.REVIEW_REQUIRED if verification_status is TaskStatus.VERIFIED else verification_status
+    task_record = lifecycle.transition(
+        task_record,
+        LifecyclePhase.REVIEW,
+        review_status,
+        "Independent review is required before merge" if review_status is TaskStatus.REVIEW_REQUIRED else outcome,
+    )
+    return lifecycle.transition(
+        task_record,
+        LifecyclePhase.DELIVER,
+        review_status,
+        "Delivery report generated from recorded execution data",
+    )
 
 
 def _save_report(root: Path, report: DeliveryReport) -> Path:
     directory = root / ".flutter-agent" / "reports"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
-    path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
+    serialized = json.dumps(report.to_dict(), indent=2)
+    path.write_text(redact_secrets(serialized), encoding="utf-8")
     return path
 
 
@@ -110,7 +167,6 @@ def doctor(project: Path = typer.Option(Path.cwd(), exists=True, file_okay=False
     if (resolved / "pubspec.yaml").exists():
         typer.echo("Flutter project: detected")
         profile = apply_project_overrides(resolved, detect_profile(resolved))
-        save_profile(resolved, profile)
         typer.echo(f"Architecture: {profile.architecture}")
         typer.echo(f"State management: {profile.state_management}")
         typer.echo(f"HTTP client: {profile.http_client}")
@@ -148,18 +204,20 @@ def run(
     audit = AuditLog(root)
     base_config = load_agent_config(root)
     contract = load_contract(contract_file.expanduser().resolve()) if contract_file else None
-    routing = route_task(task) if not model and not base_config.provider.model else None
-    routed_models = (model or base_config.provider.model,) if (model or base_config.provider.model) else routing.models
+    task_routing = route_task(task)
+    model_routing = task_routing if not model and not base_config.provider.model else None
+    routed_models = (model or base_config.provider.model,) if (model or base_config.provider.model) else task_routing.models
     # A zero-dollar run is explicitly free-tier only. Do not silently fall
     # through to a paid model after free providers are rate limited.
-    if budget_usd == 0 and routing is not None:
+    if budget_usd == 0 and model_routing is not None:
         routed_models = tuple(candidate for candidate in routed_models if candidate.endswith(":free"))
         if not routed_models:
             raise typer.ClickException("No free routed model is available for this task")
     routed_model = routed_models[0]
     audit.record("run_started", task=task, models=list(routed_models), workflow=workflow)
-    if routing is not None:
-        typer.echo(f"Routing category: {routing.category}")
+    if model_routing is not None:
+        typer.echo(f"Routing category: {task_routing.category}")
+        typer.echo(f"Playbook: {task_routing.playbook} ({task_routing.rationale})")
         typer.echo("Model fallback chain: " + " -> ".join(routed_models))
     else:
         typer.echo(f"Explicit model: {routed_model}")
@@ -172,10 +230,10 @@ def run(
             api_key_env=base_config.provider.api_key_env,
             timeout_seconds=base_config.provider.timeout_seconds,
             max_output_tokens=base_config.provider.max_output_tokens,
-                retry_attempts=base_config.provider.retry_attempts,
-                retry_backoff_seconds=base_config.provider.retry_backoff_seconds,
-                circuit_failure_threshold=base_config.provider.circuit_failure_threshold,
-                circuit_cooldown_seconds=base_config.provider.circuit_cooldown_seconds,
+            retry_attempts=base_config.provider.retry_attempts,
+            retry_backoff_seconds=base_config.provider.retry_backoff_seconds,
+            circuit_failure_threshold=base_config.provider.circuit_failure_threshold,
+            circuit_cooldown_seconds=base_config.provider.circuit_cooldown_seconds,
             input_per_million=base_config.provider.input_per_million,
             output_per_million=base_config.provider.output_per_million,
             supports_tools=base_config.provider.supports_tools,
@@ -184,6 +242,7 @@ def run(
         max_steps=max_steps or base_config.max_steps,
         max_repair_attempts=base_config.max_repair_attempts,
         budget_usd=budget_usd if budget_usd is not None else base_config.budget_usd,
+        role_models=base_config.role_models,
     )
     profile = apply_project_overrides(root, detect_profile(root))
     save_profile(root, profile)
@@ -220,67 +279,204 @@ def run(
             for provider_config in provider_configs
         )
         provider_instance = providers[0] if len(providers) == 1 else FallbackProvider(providers)
+        role_providers = {}
+        for role, role_model in config.role_models.items():
+            role_config = config.provider.model_copy(update={"model": role_model})
+            role_providers[role] = ResilientProvider(
+                create_provider(role_config),
+                retries=role_config.retry_attempts,
+                backoff_seconds=role_config.retry_backoff_seconds,
+                failure_threshold=role_config.circuit_failure_threshold,
+                cooldown_seconds=role_config.circuit_cooldown_seconds,
+            )
         registry = ToolRegistry(ProjectScope(config.resolved_root()), rules)
-        free_tier = routed_model.endswith(":free")
+        configured_models = tuple(routed_models) + tuple(config.role_models.values())
+        free_tier = all(candidate.endswith(":free") for candidate in configured_models)
         ledger = CostLedger(
             config.budget_usd,
             input_per_million=0.0 if free_tier else config.provider.input_per_million,
             output_per_million=0.0 if free_tier else config.provider.output_per_million,
         )
+        verification_engine = VerificationEngine(root)
+        verification_checks = select_flutter_checks(root, task)
+        lifecycle = TaskLifecycle()
+        task_record = create_task(
+            task,
+            root,
+            _acceptance_criteria(contract),
+            budget=BudgetLimits(config.budget_usd, config.max_steps, config.max_repair_attempts),
+        )
+        task_record = lifecycle.transition(
+            task_record,
+            LifecyclePhase.CLASSIFY,
+            TaskStatus.IN_PROGRESS,
+            task_routing.rationale,
+            task_type=task_routing.task_type,
+            risk=task_routing.risk,
+        )
         if workflow:
             skills = load_skills(root / ".flutter-agent" / "skills").select(task)
-            plan = build_plan(task, skills, contract)
+            playbook = PlaybookRegistry().get(task_routing.playbook)
+            plan = build_plan(task, skills, contract, playbook, task_routing.rationale)
+            plan_steps = tuple(
+                PlanStep(
+                    stage.role,
+                    stage.prompt,
+                    dependencies=(plan.stages[index - 1].role,) if index else (),
+                    acceptance_criteria=playbook.acceptance_criteria,
+                )
+                for index, stage in enumerate(plan.stages)
+            )
+            task_record = lifecycle.transition(
+                task_record,
+                LifecyclePhase.PLAN,
+                TaskStatus.PLANNED,
+                f"Selected {playbook.name} playbook with {len(plan.stages)} stages",
+                plan=plan_steps,
+                permissions=PermissionPolicy(
+                    tuple(sorted(set().union(*(stage.allowed_tools for stage in plan.stages)))),
+                    all("write_file" not in stage.allowed_tools for stage in plan.stages),
+                ),
+                verification_requirements=tuple(
+                    VerificationRequirement(check.name, check.argv, check.required)
+                    for check in verification_checks
+                ),
+            )
+            task_record = lifecycle.transition(
+                task_record,
+                LifecyclePhase.EXECUTE,
+                TaskStatus.IN_PROGRESS,
+                "Workflow execution started",
+            )
             orchestrator = SequentialOrchestrator(
-                ProviderSubagentRunner(provider_instance, registry, max_steps=config.max_steps, ledger=ledger)
+                ProviderSubagentRunner(
+                    provider_instance,
+                    registry,
+                    max_steps=config.max_steps,
+                    ledger=ledger,
+                    reserve_output_tokens=config.provider.max_output_tokens,
+                    role_providers=role_providers,
+                )
             )
             specs = [
-                    SubagentSpec(stage.role, stage.prompt, stage.allowed_tools)
-                    for stage in plan.stages
+                SubagentSpec(stage.role, stage.prompt, stage.allowed_tools)
+                for stage in plan.stages
             ]
+            verification_reports: list[VerificationReport] = []
+
+            def verify_workflow(_outputs: tuple[str, ...]) -> tuple[bool, str]:
+                report = verification_engine.verify(verification_checks, contract)
+                verification_reports.append(report)
+                audit.record("verification_completed", **report.to_dict())
+                return report.verified, report.summary
+
             workflow_result = WorkflowExecutor(orchestrator, config.max_repair_attempts).run(
                 specs,
                 task + f"\nDetected project profile: {profile}",
-                lambda outputs: (
-                    True,
-                    "",
-                ) if contract is None else (
-                    (contract_result := validate_contract(root, contract)).passed,
-                    "; ".join(contract_result.findings),
-                ),
+                verify_workflow,
             )
+            verification_report = verification_reports[-1] if verification_reports else None
             if not workflow_result.completed:
+                task_record = _finish_lifecycle(
+                    task_record,
+                    lifecycle,
+                    verification_report,
+                    workflow_result.error or "Workflow execution failed",
+                )
                 report_path = _save_report(
                     root,
-                    DeliveryReport(task, False, tuple(stage.role for stage in plan.stages), workflow_result.outputs, workflow_result.error),
+                    DeliveryReport.from_task(
+                        task_record,
+                        completed=False,
+                        stages=tuple(stage.role for stage in plan.stages),
+                        outputs=workflow_result.outputs,
+                        error=workflow_result.error,
+                        verification=verification_report.to_dict() if verification_report else None,
+                    ),
                 )
                 typer.echo(f"Workflow incomplete: {workflow_result.error}")
                 typer.echo(f"Report: {report_path}")
-                audit.record("run_completed", completed=False, error=workflow_result.error)
+                audit.record("run_completed", completed=False, status=task_record.status.value, error=workflow_result.error)
                 raise typer.Exit(code=1)
+            task_record = _finish_lifecycle(task_record, lifecycle, verification_report, "Workflow completed")
             report_path = _save_report(
                 root,
-                DeliveryReport(task, True, tuple(stage.role for stage in plan.stages), workflow_result.outputs),
+                DeliveryReport.from_task(
+                    task_record,
+                    completed=True,
+                    stages=tuple(stage.role for stage in plan.stages),
+                    outputs=workflow_result.outputs,
+                    verification=verification_report.to_dict() if verification_report else None,
+                ),
             )
             typer.echo(workflow_result.outputs[-1] if workflow_result.outputs else "Workflow completed")
             typer.echo(f"Stages: {len(workflow_result.outputs)}; Repairs: {workflow_result.repairs}")
             typer.echo(f"Report: {report_path}")
-            audit.record("run_completed", completed=True, stages=len(workflow_result.outputs), repairs=workflow_result.repairs)
+            audit.record("run_completed", completed=True, status=task_record.status.value, stages=len(workflow_result.outputs), repairs=workflow_result.repairs)
             return
-        result = AgentLoop(provider_instance, registry, max_steps=config.max_steps, ledger=ledger, contract=contract).run(task)
+        task_record = lifecycle.transition(
+            task_record,
+            LifecyclePhase.PLAN,
+            TaskStatus.PLANNED,
+            "Selected bounded single-agent execution",
+            plan=(PlanStep("single-agent", "Execute the scoped task with governed tools"),),
+            permissions=PermissionPolicy(tuple(sorted(tool["function"]["name"] for tool in registry.schemas()))),
+            verification_requirements=tuple(
+                VerificationRequirement(check.name, check.argv, check.required)
+                for check in verification_checks
+            ),
+        )
+        task_record = lifecycle.transition(
+            task_record,
+            LifecyclePhase.EXECUTE,
+            TaskStatus.IN_PROGRESS,
+            "Single-agent execution started",
+        )
+        result = AgentLoop(provider_instance, registry, max_steps=config.max_steps, ledger=ledger, contract=contract, reserve_output_tokens=config.provider.max_output_tokens).run(task)
     except (ValueError, PermissionError, RuntimeError) as exc:
         raise typer.ClickException(str(exc)) from exc
-    if result.completed:
-        report_path = _save_report(root, DeliveryReport(task, True, ("single-agent",), (result.text or "",)))
+    verification_report = verification_engine.verify(verification_checks, contract) if result.completed else None
+    if verification_report is not None:
+        audit.record("verification_completed", **verification_report.to_dict())
+    if result.completed and verification_report is not None and verification_report.verified:
+        task_record = _finish_lifecycle(task_record, lifecycle, verification_report, "Execution completed")
+        report_path = _save_report(
+            root,
+            DeliveryReport.from_task(
+                task_record,
+                completed=True,
+                stages=("single-agent",),
+                outputs=(result.text or "",),
+                verification=verification_report.to_dict(),
+            ),
+        )
         typer.echo(result.text or "Task completed")
         typer.echo(f"Steps: {result.steps}")
         typer.echo(f"Report: {report_path}")
-        audit.record("run_completed", completed=True, steps=result.steps)
+        audit.record("run_completed", completed=True, status=task_record.status.value, steps=result.steps)
     else:
-        report_path = _save_report(root, DeliveryReport(task, False, ("single-agent",), (result.text or "",), result.error))
-        typer.echo(f"Task incomplete: {result.error}")
+        verification_error = verification_report.summary if verification_report is not None else result.error
+        task_record = _finish_lifecycle(
+            task_record,
+            lifecycle,
+            verification_report,
+            verification_error or "Execution failed",
+        )
+        report_path = _save_report(
+            root,
+            DeliveryReport.from_task(
+                task_record,
+                completed=False,
+                stages=("single-agent",),
+                outputs=(result.text or "",),
+                error=verification_error,
+                verification=verification_report.to_dict() if verification_report else None,
+            ),
+        )
+        typer.echo(f"Task incomplete: {verification_error}")
         typer.echo(f"Steps: {result.steps}")
         typer.echo(f"Report: {report_path}")
-        audit.record("run_completed", completed=False, steps=result.steps, error=result.error)
+        audit.record("run_completed", completed=False, status=task_record.status.value, steps=result.steps, error=verification_error)
         raise typer.Exit(code=1)
 
 

@@ -30,6 +30,7 @@ class AgentConfig(BaseModel):
     max_steps: int = Field(default=12, ge=1, le=100)
     max_repair_attempts: int = Field(default=2, ge=0, le=5)
     budget_usd: float = Field(default=10.0, ge=0)
+    role_models: dict[str, str] = Field(default_factory=dict)
 
     def resolved_root(self) -> Path:
         return self.project_root.expanduser().resolve()

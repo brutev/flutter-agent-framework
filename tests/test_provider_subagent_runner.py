@@ -24,3 +24,20 @@ def test_provider_runner_executes_subagent_with_granted_tools(tmp_path: Path) ->
     )
     assert output == "Analysis complete"
 
+
+def test_provider_runner_uses_role_specific_provider(tmp_path: Path) -> None:
+    default = FakeProvider()
+
+    class ReviewerProvider(FakeProvider):
+        def complete(self, messages, tools):
+            assert "reviewer" in messages[-1]["content"]
+            return ModelResponse("Independent review")
+
+    runner = ProviderSubagentRunner(
+        default,
+        ToolRegistry(ProjectScope(tmp_path)),
+        role_providers={"reviewer": ReviewerProvider()},
+    )
+    output = runner.run(SubagentSpec("reviewer", "Review diff", frozenset({"read_file"})), "requirements")
+    assert output == "Independent review"
+
